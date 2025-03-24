@@ -10,6 +10,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -211,6 +212,38 @@ namespace Microsoft.Health.Fhir.Api.Features.Resources.Bundle
                     };
 
                     await ProcessAllResourcesInABundleAsRequestsAsync(responseBundle, processingLogic, cancellationToken);
+
+                    // Update the entry response values (Location/ETag)
+                    // http://hl7.org/fhir/http.html#transaction-response
+                    bool preferMinimal = false;
+                    if (_fhirRequestContextAccessor.RequestContext.RequestHeaders.TryGetValue(KnownHeaders.Prefer, out var preferValue))
+                    {
+                        if (preferValue.Contains("return=minimal"))
+                        {
+                            preferMinimal = true;
+                        }
+                    }
+
+                    for (int n = 0; n < bundleResource.Entry.Count; n++)
+                    {
+                        responseBundle.Entry[n].FullUrl = bundleResource.Entry[n].FullUrl;
+                        var resource = responseBundle.Entry[n].Resource;
+                        if (resource != null)
+                        {
+                            responseBundle.Entry[n].Response.Location = $"{_fhirRequestContextAccessor.RequestContext.BaseUri}{resource.TypeName}/{resource.Id}";
+                            if (!string.IsNullOrEmpty(resource.Meta?.VersionId))
+                            {
+                                responseBundle.Entry[n].Response.Location += $"/_history/{resource.Meta.VersionId}";
+                                responseBundle.Entry[n].Response.Etag = $"W/\"{resource.Meta.VersionId}\"";
+                            }
+                        }
+
+                        if (preferMinimal)
+                        {
+                            // remove the resource if the prefer header doesn't need it
+                            responseBundle.Entry[n].Resource = null;
+                        }
+                    }
 
                     var response = new BundleResponse(
                         responseBundle.ToResourceElement(),

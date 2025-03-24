@@ -53,7 +53,7 @@ namespace Microsoft.Health.Fhir.Api.Features.Resources
 
         public async Task<DeleteResourceResponse> Handle(DeleteResourceRequest request, RequestHandlerDelegate<DeleteResourceResponse> next, CancellationToken cancellationToken)
         {
-            var resources = _profilesResolver.GetProfilesTypes();
+            System.Collections.Generic.IReadOnlySet<string> resources = _profilesResolver.GetProfilesTypes();
             if (resources.Contains(request.ResourceKey.ResourceType))
             {
                 if (await _authorizationService.CheckAccess(DataActions.EditProfileDefinitions, cancellationToken) != DataActions.EditProfileDefinitions)
@@ -61,7 +61,7 @@ namespace Microsoft.Health.Fhir.Api.Features.Resources
                     throw new UnauthorizedFhirActionException();
                 }
 
-                var result = await next();
+                DeleteResourceResponse result = await next();
 
                 // If the requests is part of a bundle, as an inner request, then profiles are not refreshed.
                 // This is because the bundle can contain multiple profile changes and the refresh should only happen once, at the end of the bundle, to avoid performance degradation.
@@ -86,7 +86,7 @@ namespace Microsoft.Health.Fhir.Api.Features.Resources
             RequestHandlerDelegate<TResponse> next,
             CancellationToken cancellationToken)
         {
-            var resources = _profilesResolver.GetProfilesTypes();
+            System.Collections.Generic.IReadOnlySet<string> resources = _profilesResolver.GetProfilesTypes();
             if (resources.Contains(resourceType))
             {
                 if (await _authorizationService.CheckAccess(DataActions.EditProfileDefinitions, cancellationToken) != DataActions.EditProfileDefinitions)
@@ -94,15 +94,14 @@ namespace Microsoft.Health.Fhir.Api.Features.Resources
                     throw new UnauthorizedFhirActionException();
                 }
 
-                var result = await next();
+                TResponse result = await next();
 
                 // If the requests is part of a bundle, as an inner request, then profiles are not refreshed.
                 // This is because the bundle can contain multiple profile changes and the refresh should only happen once, at the end of the bundle, to avoid performance degradation.
                 if (bundleResourceContext == null)
                 {
                     // read the raw resource and get the canonical URL and version
-                    var ivr = resource?.ResourceInstance as IVersionableConformanceResource;
-                    if (ivr != null)
+                    if (resource?.ResourceInstance is IVersionableConformanceResource ivr)
                     {
                         // invalidate just this canonical URL
                         await _profilesResolver.Refresh(ivr.Url, ivr.Version, resourceType, resourceId, resource);

@@ -62,9 +62,9 @@ namespace Microsoft.Health.Fhir.R4.ResourceParser
 
             var definitionManagerTask = searchParameterDefinitionManager.StartAsync(CancellationToken.None);
             var resolverTask = codeSystemResolver.StartAsync(CancellationToken.None);
-            var comparmentTask = compartmentDefinitionManager.StartAsync(CancellationToken.None);
+            var compartmentTask = compartmentDefinitionManager.StartAsync(CancellationToken.None);
 
-            var startupTasks = System.Threading.Tasks.Task.WhenAll(definitionManagerTask, resolverTask, comparmentTask);
+            var startupTasks = System.Threading.Tasks.Task.WhenAll(definitionManagerTask, resolverTask, compartmentTask);
             while (!startupTasks.IsCompleted)
             {
                 Thread.Sleep(500);

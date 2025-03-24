@@ -90,14 +90,13 @@ namespace Microsoft.Health.Fhir.Core.Features.Validation
             using (var memoryStream = new MemoryStream(Encoding.UTF8.GetBytes(rawJson)))
             {
                 using var navStream = new JsonNavigatorStream(memoryStream);
-                Action<ArtifactSummaryPropertyBag> setOrigin =
-                    (properties) =>
-                    {
-                        properties[ArtifactSummaryProperties.OriginKey] = rawJson;
-                        properties[ArtifactSummaryPropertiesResourceIdKey] = resourceId;
-                    };
+                void SetOrigin(ArtifactSummaryPropertyBag properties)
+                {
+                    properties[ArtifactSummaryProperties.OriginKey] = rawJson;
+                    properties[ArtifactSummaryPropertiesResourceIdKey] = resourceId;
+                }
 
-                artifacts = generator.Generate(navStream, setOrigin);
+                artifacts = generator.Generate(navStream, SetOrigin);
             }
 
             // Check that the item is in the cache
@@ -261,20 +260,19 @@ namespace Microsoft.Health.Fhir.Core.Features.Validation
                                 using (var memoryStream = new MemoryStream(Encoding.UTF8.GetBytes(searchItem.Resource.RawResource.Data)))
                                 {
                                     using var navStream = new JsonNavigatorStream(memoryStream);
-                                    Action<ArtifactSummaryPropertyBag> setOrigin =
-                                        (properties) =>
-                                        {
-                                            properties[ArtifactSummaryProperties.OriginKey] = searchItem.Resource.RawResource.Data;
-                                            properties[ArtifactSummaryPropertiesResourceIdKey] = searchItem.Resource.ResourceId;
-                                        };
+                                    void SetOrigin(ArtifactSummaryPropertyBag properties)
+                                    {
+                                        properties[ArtifactSummaryProperties.OriginKey] = searchItem.Resource.RawResource.Data;
+                                        properties[ArtifactSummaryPropertiesResourceIdKey] = searchItem.Resource.ResourceId;
+                                    }
 
 #if Stu3
-                                    List<ArtifactSummary> artifacts = ArtifactSummaryGenerator.Default.Generate(navStream, setOrigin);
+                                    List<ArtifactSummary> artifacts = ArtifactSummaryGenerator.Default.Generate(navStream, SetOrigin);
 #else
-                                    List<ArtifactSummary> artifacts = new ArtifactSummaryGenerator(ModelInfo.ModelInspector).Generate(navStream, setOrigin);
+                                    List<ArtifactSummary> artifacts = new ArtifactSummaryGenerator(ModelInfo.ModelInspector).Generate(navStream, SetOrigin);
 #endif
 
-                                    foreach (var artifact in artifacts)
+                                    foreach (ArtifactSummary artifact in artifacts)
                                     {
                                         result[artifact.ResourceUri] = artifact;
                                     }
@@ -306,7 +304,7 @@ namespace Microsoft.Health.Fhir.Core.Features.Validation
                     if (navStream.Current != null)
                     {
                         // TODO: Cache this parsed resource, to prevent parsing again and again
-                        var resource = navStream.Current.ToPoco<Resource>();
+                        Resource resource = navStream.Current.ToPoco<Resource>();
                         return resource;
                     }
                 }
@@ -317,13 +315,13 @@ namespace Microsoft.Health.Fhir.Core.Features.Validation
 
         public Resource ResolveByCanonicalUri(string uri)
         {
-            var summary = ListSummaries().ResolveByCanonicalUri(uri);
+            ArtifactSummary summary = ListSummaries().ResolveByCanonicalUri(uri);
             return LoadBySummary(summary);
         }
 
         public Resource ResolveByUri(string uri)
         {
-            var summary = ListSummaries().ResolveByUri(uri);
+            ArtifactSummary summary = ListSummaries().ResolveByUri(uri);
             return LoadBySummary(summary);
         }
 

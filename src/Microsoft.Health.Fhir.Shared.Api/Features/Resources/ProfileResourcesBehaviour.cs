@@ -6,7 +6,9 @@
 using System.Threading;
 using System.Threading.Tasks;
 using EnsureThat;
+using Hl7.Fhir.Model;
 using MediatR;
+using Microsoft.CodeAnalysis;
 using Microsoft.Health.Core.Features.Security.Authorization;
 using Microsoft.Health.Fhir.Core.Exceptions;
 using Microsoft.Health.Fhir.Core.Features.Security;
@@ -38,22 +40,48 @@ namespace Microsoft.Health.Fhir.Api.Features.Resources
         }
 
         public async Task<UpsertResourceResponse> Handle(ConditionalUpsertResourceRequest request, RequestHandlerDelegate<UpsertResourceResponse> next, CancellationToken cancellationToken)
-            => await GenericHandle(request.Resource.InstanceType, request.BundleResourceContext, next, cancellationToken);
+            => await GenericHandle(request.Resource.InstanceType, request.Resource.Id, request.Resource, request.BundleResourceContext, next, cancellationToken);
 
         public async Task<UpsertResourceResponse> Handle(ConditionalCreateResourceRequest request, RequestHandlerDelegate<UpsertResourceResponse> next, CancellationToken cancellationToken)
-            => await GenericHandle(request.Resource.InstanceType, request.BundleResourceContext, next, cancellationToken);
+            => await GenericHandle(request.Resource.InstanceType, request.Resource.Id, request.Resource, request.BundleResourceContext, next, cancellationToken);
 
         public async Task<UpsertResourceResponse> Handle(UpsertResourceRequest request, RequestHandlerDelegate<UpsertResourceResponse> next, CancellationToken cancellationToken)
-            => await GenericHandle(request.Resource.InstanceType, request.BundleResourceContext, next, cancellationToken);
+            => await GenericHandle(request.Resource.InstanceType, request.Resource.Id, request.Resource, request.BundleResourceContext, next, cancellationToken);
 
         public async Task<UpsertResourceResponse> Handle(CreateResourceRequest request, RequestHandlerDelegate<UpsertResourceResponse> next, CancellationToken cancellationToken)
-            => await GenericHandle(request.Resource.InstanceType, request.BundleResourceContext, next, cancellationToken);
+            => await GenericHandle(request.Resource.InstanceType, request.Resource.Id, request.Resource, request.BundleResourceContext, next, cancellationToken);
 
         public async Task<DeleteResourceResponse> Handle(DeleteResourceRequest request, RequestHandlerDelegate<DeleteResourceResponse> next, CancellationToken cancellationToken)
-            => await GenericHandle(request.ResourceKey.ResourceType, request.BundleResourceContext, next, cancellationToken);
+        {
+            var resources = _profilesResolver.GetProfilesTypes();
+            if (resources.Contains(request.ResourceKey.ResourceType))
+            {
+                if (await _authorizationService.CheckAccess(DataActions.EditProfileDefinitions, cancellationToken) != DataActions.EditProfileDefinitions)
+                {
+                    throw new UnauthorizedFhirActionException();
+                }
+
+                var result = await next();
+
+                // If the requests is part of a bundle, as an inner request, then profiles are not refreshed.
+                // This is because the bundle can contain multiple profile changes and the refresh should only happen once, at the end of the bundle, to avoid performance degradation.
+                if (request.BundleResourceContext == null)
+                {
+                    await _profilesResolver.Delete(request.ResourceKey.ResourceType, request.ResourceKey.Id);
+                }
+
+                return result;
+            }
+            else
+            {
+                return await next();
+            }
+        }
 
         private async Task<TResponse> GenericHandle<TResponse>(
             string resourceType,
+            string resourceId,
+            ResourceElement resource,
             BundleResourceContext bundleResourceContext,
             RequestHandlerDelegate<TResponse> next,
             CancellationToken cancellationToken)
@@ -72,7 +100,17 @@ namespace Microsoft.Health.Fhir.Api.Features.Resources
                 // This is because the bundle can contain multiple profile changes and the refresh should only happen once, at the end of the bundle, to avoid performance degradation.
                 if (bundleResourceContext == null)
                 {
-                    _profilesResolver.Refresh();
+                    // read the raw resource and get the canonical URL and version
+                    var ivr = resource?.ResourceInstance as IVersionableConformanceResource;
+                    if (ivr != null)
+                    {
+                        // invalidate just this canonical URL
+                        await _profilesResolver.Refresh(ivr.Url, ivr.Version, resourceType, resourceId, resource);
+                    }
+                    else
+                    {
+                        _profilesResolver.Refresh();
+                    }
                 }
 
                 return result;

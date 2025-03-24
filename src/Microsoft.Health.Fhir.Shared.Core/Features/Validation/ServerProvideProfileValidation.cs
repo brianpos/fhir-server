@@ -17,6 +17,7 @@ using Hl7.Fhir.Serialization;
 using Hl7.Fhir.Specification.Source;
 using Hl7.Fhir.Specification.Summary;
 using MediatR;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.Health.Core.Extensions;
 using Microsoft.Health.Extensions.DependencyInjection;
@@ -30,20 +31,24 @@ namespace Microsoft.Health.Fhir.Core.Features.Validation
     /// <summary>
     /// Provides profiles by fetching them from the server.
     /// </summary>
-    public sealed class ServerProvideProfileValidation : IProvideProfilesForValidation
+    public sealed class ServerProvideProfileValidation : IProvideProfilesForValidation, IDisposable
     {
         private static HashSet<string> _supportedTypes = new HashSet<string>() { "ValueSet", "StructureDefinition", "CodeSystem" };
         private readonly Func<IScoped<ISearchService>> _searchServiceFactory;
         private readonly ValidateOperationConfiguration _validateOperationConfig;
         private readonly IMediator _mediator;
+        private readonly ILogger<ServerProvideProfileValidation> _logger;
         private List<ArtifactSummary> _summaries = new List<ArtifactSummary>();
         private DateTime _expirationTime;
-        private object _lockSummaries = new object();
+        private SemaphoreSlim _lockSummaries = new SemaphoreSlim(1, 1);
+
+        private const string ArtifactSummaryPropertiesResourceIdKey = "ResourceId";
 
         public ServerProvideProfileValidation(
             Func<IScoped<ISearchService>> searchServiceFactory,
             IOptions<ValidateOperationConfiguration> options,
-            IMediator mediator)
+            IMediator mediator,
+            ILogger<ServerProvideProfileValidation> logger)
         {
             EnsureArg.IsNotNull(searchServiceFactory, nameof(searchServiceFactory));
             EnsureArg.IsNotNull(options?.Value, nameof(options));
@@ -53,6 +58,7 @@ namespace Microsoft.Health.Fhir.Core.Features.Validation
             _expirationTime = DateTime.UtcNow;
             _validateOperationConfig = options.Value;
             _mediator = mediator;
+            _logger = logger;
         }
 
         public IReadOnlySet<string> GetProfilesTypes() => _supportedTypes;
@@ -63,6 +69,133 @@ namespace Microsoft.Health.Fhir.Core.Features.Validation
             ListSummaries();
         }
 
+        public async System.Threading.Tasks.Task Refresh(string canonicalUrl, string canonicalVersion, string resourceType, string resourceId, Models.ResourceElement resource)
+        {
+            _expirationTime = DateTime.UtcNow.AddMilliseconds(-1);
+
+            // Instead of just reloading all the summaries from disk, patch the resource into the _summaries
+            var oldHash = GetHashForSupportedProfiles(_summaries);
+
+            // The summaries cache is populated with Artifact summaries which must be scanned from the raw JSON
+            // content, so need to scan the resource as Json content
+            // Process out the content from the request
+            string rawJson = await resource.Instance.ToJsonAsync();
+            ArtifactSummaryGenerator generator;
+            List<ArtifactSummary> artifacts;
+#if Stu3
+            generator = ArtifactSummaryGenerator.Default;
+#else
+            generator = new ArtifactSummaryGenerator(ModelInfo.ModelInspector);
+#endif
+            using (var memoryStream = new MemoryStream(Encoding.UTF8.GetBytes(rawJson)))
+            {
+                using var navStream = new JsonNavigatorStream(memoryStream);
+                Action<ArtifactSummaryPropertyBag> setOrigin =
+                    (properties) =>
+                    {
+                        properties[ArtifactSummaryProperties.OriginKey] = rawJson;
+                        properties[ArtifactSummaryPropertiesResourceIdKey] = resourceId;
+                    };
+
+                artifacts = generator.Generate(navStream, setOrigin);
+            }
+
+            // Check that the item is in the cache
+            if (await _lockSummaries.WaitAsync(TimeSpan.FromSeconds(10)))
+            {
+                try
+                {
+                    if (!string.IsNullOrEmpty(canonicalUrl))
+                    {
+                        // This is not canonical version resilient, but will be in the next version
+                        // var existingEntries = _summaries.Where(s => s.GetConformanceCanonicalUrl() == canonicalUrl && s.GetConformanceVersion() == canonicalVersion).ToList();
+                        var existingEntries = _summaries.Where(s => s.GetConformanceCanonicalUrl() == canonicalUrl).ToList();
+                        if (existingEntries.Count > 0)
+                        {
+                            // remove the old ones (version aware)
+                            _summaries.RemoveAll(s => existingEntries.Contains(s));
+                        }
+
+                        // Add in the loaded artifacts
+                        _summaries.AddRange(artifacts);
+                    }
+                    else
+                    {
+                        // This is an update to a canonical resource with no canonical URL, so remove from the cache if it exists, by Type/ID.
+                        var existingEntries = _summaries.Where(s => s.ResourceTypeName == resourceType && s.GetValueOrDefault<string>(ArtifactSummaryPropertiesResourceIdKey) == resourceId).ToList();
+                        if (existingEntries.Count > 0)
+                        {
+                            // remove the resource
+                            _summaries.RemoveAll(s => existingEntries.Contains(s));
+                        }
+                    }
+                }
+                finally
+                {
+                    _lockSummaries.Release();
+                }
+            }
+            else
+            {
+                // The lock timed out, this should be logged, as this is a potential deadlock occurrence
+                _logger.LogError($"Timed out waiting for the lock to refresh {canonicalUrl}|{canonicalVersion} ({resourceType}/{resourceId}) in the summaries.");
+            }
+
+            // This is the part that is deadlocking
+            // var result = await GetSummaries();
+            // _summaries = result;
+            var newHash = GetHashForSupportedProfiles(_summaries);
+            _expirationTime = DateTime.UtcNow.AddSeconds(_validateOperationConfig.CacheDurationInSeconds);
+
+            if (newHash != oldHash)
+            {
+                await _mediator.Publish(new RebuildCapabilityStatement(RebuildPart.Profiles));
+            }
+        }
+
+        public async System.Threading.Tasks.Task Delete(string resourceType, string resourceId)
+        {
+            _expirationTime = DateTime.UtcNow.AddMilliseconds(-1);
+
+            // Instead of just reloading all the summaries from disk, patch the resource into the _summaries
+            var oldHash = GetHashForSupportedProfiles(_summaries);
+
+            // Check that the item is in the cache
+            if (await _lockSummaries.WaitAsync(TimeSpan.FromSeconds(10)))
+            {
+                try
+                {
+                    // This is the removal of a canonical resource, these are done by ID.
+                    var existingEntries = _summaries.Where(s => s.ResourceTypeName == resourceType && s.GetValueOrDefault<string>(ArtifactSummaryPropertiesResourceIdKey) == resourceId).ToList();
+                    if (existingEntries.Count > 0)
+                    {
+                        // remove the resource
+                        _summaries.RemoveAll(s => existingEntries.Contains(s));
+                    }
+                }
+                finally
+                {
+                    _lockSummaries.Release();
+                }
+            }
+            else
+            {
+                // The lock timed out, this should be logged, as this is a potential deadlock occurrence
+                _logger.LogError($"Timed out waiting for the lock to delete ({resourceType}/{resourceId}) in the summaries.");
+            }
+
+            // This is the part that is deadlocking
+            // var result = await GetSummaries();
+            // _summaries = result;
+            var newHash = GetHashForSupportedProfiles(_summaries);
+            _expirationTime = DateTime.UtcNow.AddSeconds(_validateOperationConfig.CacheDurationInSeconds);
+
+            if (newHash != oldHash)
+            {
+                await _mediator.Publish(new RebuildCapabilityStatement(RebuildPart.Profiles));
+            }
+        }
+
         public IEnumerable<ArtifactSummary> ListSummaries(bool resetStatementIfNew = true, bool disablePull = false)
         {
             if (disablePull)
@@ -70,24 +203,38 @@ namespace Microsoft.Health.Fhir.Core.Features.Validation
                 return _summaries;
             }
 
-            lock (_lockSummaries)
+            if (_lockSummaries.Wait(TimeSpan.FromSeconds(10)))
             {
-                if (_expirationTime < DateTime.UtcNow)
+                try
                 {
-                    var oldHash = resetStatementIfNew ? GetHashForSupportedProfiles(_summaries) : string.Empty;
-                    var result = System.Threading.Tasks.Task.Run(() => GetSummaries()).GetAwaiter().GetResult();
-                    _summaries = result;
-                    var newHash = resetStatementIfNew ? GetHashForSupportedProfiles(_summaries) : string.Empty;
-                    _expirationTime = DateTime.UtcNow.AddSeconds(_validateOperationConfig.CacheDurationInSeconds);
-
-                    if (newHash != oldHash)
+                    if (_expirationTime < DateTime.UtcNow)
                     {
-                        System.Threading.Tasks.Task.Run(() => _mediator.Publish(new RebuildCapabilityStatement(RebuildPart.Profiles))).GetAwaiter().GetResult();
+                        var oldHash = resetStatementIfNew ? GetHashForSupportedProfiles(_summaries) : string.Empty;
+
+                        // This is the part that is deadlocking
+                        List<ArtifactSummary> result = GetSummaries().GetAwaiter().GetResult();
+                        _summaries = result;
+                        var newHash = resetStatementIfNew ? GetHashForSupportedProfiles(_summaries) : string.Empty;
+                        _expirationTime = DateTime.UtcNow.AddSeconds(_validateOperationConfig.CacheDurationInSeconds);
+
+                        if (newHash != oldHash)
+                        {
+                            _mediator.Publish(new RebuildCapabilityStatement(RebuildPart.Profiles)).GetAwaiter().GetResult();
+                        }
                     }
                 }
-
-                return _summaries;
+                finally
+                {
+                    _lockSummaries.Release();
+                }
             }
+            else
+            {
+                // The lock timed out, this should be logged, as this is a potential deadlock occurrence
+                _logger.LogError("Timed out waiting for the lock to refresh the summaries.");
+            }
+
+            return _summaries;
         }
 
         private async Task<List<ArtifactSummary>> GetSummaries()
@@ -108,8 +255,8 @@ namespace Microsoft.Health.Fhir.Core.Features.Validation
                                 queryParameters.Add(new Tuple<string, string>(KnownQueryParameterNames.ContinuationToken, ct));
                             }
 
-                            var searchResult = await searchService.Value.SearchAsync(type, queryParameters, CancellationToken.None);
-                            foreach (var searchItem in searchResult.Results)
+                            SearchResult searchResult = await searchService.Value.SearchAsync(type, queryParameters, CancellationToken.None);
+                            foreach (SearchResultEntry searchItem in searchResult.Results)
                             {
                                 using (var memoryStream = new MemoryStream(Encoding.UTF8.GetBytes(searchItem.Resource.RawResource.Data)))
                                 {
@@ -118,6 +265,7 @@ namespace Microsoft.Health.Fhir.Core.Features.Validation
                                         (properties) =>
                                         {
                                             properties[ArtifactSummaryProperties.OriginKey] = searchItem.Resource.RawResource.Data;
+                                            properties[ArtifactSummaryPropertiesResourceIdKey] = searchItem.Resource.ResourceId;
                                         };
 
 #if Stu3
@@ -208,6 +356,11 @@ namespace Microsoft.Health.Fhir.Core.Features.Validation
                .Select(x => x.ResourceUri).ToList().ForEach(url => sb.Append(url));
 
             return sb.ToString().ComputeHash();
+        }
+
+        public void Dispose()
+        {
+            _lockSummaries.Dispose();
         }
     }
 }

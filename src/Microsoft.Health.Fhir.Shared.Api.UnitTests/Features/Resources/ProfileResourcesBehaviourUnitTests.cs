@@ -9,11 +9,13 @@ using System.Threading;
 using Hl7.Fhir.ElementModel;
 using Hl7.Fhir.Model;
 using MediatR;
+using Microsoft.AspNetCore.Razor.Language.Intermediate;
 using Microsoft.Health.Core.Features.Security.Authorization;
 using Microsoft.Health.Fhir.Api.Features.Resources;
 using Microsoft.Health.Fhir.Core.Features.Security;
 using Microsoft.Health.Fhir.Core.Features.Validation;
 using Microsoft.Health.Fhir.Core.Messages.Create;
+using Microsoft.Health.Fhir.Core.Messages.Delete;
 using Microsoft.Health.Fhir.Core.Messages.Upsert;
 using Microsoft.Health.Fhir.Core.Models;
 using Microsoft.Health.Fhir.Tests.Common;
@@ -46,8 +48,8 @@ namespace Microsoft.Health.Fhir.Api.UnitTests.Features.Resources
         [Fact]
         public async Task GivenProfileResourcesBehaviour_WhenExecutedOutOfBundleContext_ThenCallProfileResolverRefresh()
         {
-            ValueSet valueSet = new ValueSet();
-            ResourceElement resourceElement = new ResourceElement(valueSet.ToTypedElement());
+            ValueSet valueSet = new ValueSet() { Id = "123", Url = "http://example.org/ValueSet/123", Version = "v1" };
+            ResourceElement resourceElement = new ResourceElement(valueSet.ToTypedElement(), valueSet);
 
             var requestHandlerDelegate = Substitute.For<RequestHandlerDelegate<UpsertResourceResponse>>();
 
@@ -59,7 +61,10 @@ namespace Microsoft.Health.Fhir.Api.UnitTests.Features.Resources
                 default);
 
             // Out of the bundle context, ProfileResourcesBehaviour should call the profile resolver refresh.
-            _profilesResolver.Received(1).Refresh();
+            await _profilesResolver.Received(1).Refresh(valueSet.Url, valueSet.Version, valueSet.TypeName, valueSet.Id, resourceElement);
+
+            // And the "blind" refresh should not be called
+            _profilesResolver.Received(0).Refresh();
         }
 
         [Fact]
@@ -70,8 +75,8 @@ namespace Microsoft.Health.Fhir.Api.UnitTests.Features.Resources
                 Hl7.Fhir.Rest.HTTPVerb.POST,
                 Guid.NewGuid());
 
-            ValueSet valueSet = new ValueSet();
-            ResourceElement resourceElement = new ResourceElement(valueSet.ToTypedElement());
+            ValueSet valueSet = new ValueSet() { Id = "123", Url = "http://example.org/ValueSet/123", Version = "v1" };
+            ResourceElement resourceElement = new ResourceElement(valueSet.ToTypedElement(), valueSet);
 
             var requestHandlerDelegate = Substitute.For<RequestHandlerDelegate<UpsertResourceResponse>>();
 
@@ -84,6 +89,72 @@ namespace Microsoft.Health.Fhir.Api.UnitTests.Features.Resources
 
             // Under the bundle context, ProfileResourcesBehaviour should not call the profile resolver refresh.
             _profilesResolver.Received(0).Refresh();
+            await _profilesResolver.Received(0).Refresh(valueSet.Url, valueSet.Version, valueSet.TypeName, valueSet.Id, resourceElement);
+        }
+
+        [Fact]
+        public async Task GivenProfileResourcesBehaviour_WhenExecutedOutOfBundleContext_ThenCallEmptyProfileUrlResolverRefresh()
+        {
+            ValueSet valueSet = new ValueSet() { Id = "123" };
+            ResourceElement resourceElement = new ResourceElement(valueSet.ToTypedElement(), valueSet);
+
+            var requestHandlerDelegate = Substitute.For<RequestHandlerDelegate<UpsertResourceResponse>>();
+
+            await _profileResourcesBehaviour.Handle(
+                new CreateResourceRequest(
+                    resourceElement,
+                    bundleResourceContext: null),
+                requestHandlerDelegate,
+                default);
+
+            // Out of the bundle context, ProfileResourcesBehaviour should call the profile resolver refresh.
+            await _profilesResolver.Received(1).Refresh(null, null, valueSet.TypeName, valueSet.Id, resourceElement);
+
+            // And the "blind" refresh should not be called
+            _profilesResolver.Received(0).Refresh();
+        }
+
+        [Fact]
+        public async Task GivenProfileResourcesBehaviour_WhenExecutedUnderTheBundleContext_ThenCallProfileResolverDelete()
+        {
+            var bundleResourceContext = new BundleResourceContext(
+                BundleProcessingLogic.Parallel,
+                Hl7.Fhir.Rest.HTTPVerb.DELETE,
+                Guid.NewGuid());
+
+            var requestHandlerDelegate = Substitute.For<RequestHandlerDelegate<DeleteResourceResponse>>();
+
+            await _profileResourcesBehaviour.Handle(
+                new DeleteResourceRequest(
+                    new Core.Features.Persistence.ResourceKey("ValueSet", "123"),
+                    DeleteOperation.SoftDelete,
+                    bundleResourceContext: bundleResourceContext,
+                    false),
+                requestHandlerDelegate,
+                default);
+
+            // Under the bundle context, ProfileResourcesBehaviour should not call the profile resolver refresh.
+            _profilesResolver.Received(0).Refresh();
+            await _profilesResolver.Received(0).Delete("ValueSet", "123");
+        }
+
+        [Fact]
+        public async Task GivenProfileResourcesBehaviour_WhenExecutedOutOfTheBundleContext_ThenCallProfileResolverDelete()
+        {
+            var requestHandlerDelegate = Substitute.For<RequestHandlerDelegate<DeleteResourceResponse>>();
+
+            await _profileResourcesBehaviour.Handle(
+                new DeleteResourceRequest(
+                    new Core.Features.Persistence.ResourceKey("ValueSet", "123"),
+                    DeleteOperation.SoftDelete,
+                    bundleResourceContext: null,
+                    false),
+                requestHandlerDelegate,
+                default);
+
+            // Under the bundle context, ProfileResourcesBehaviour should not call the profile resolver refresh.
+            _profilesResolver.Received(0).Refresh();
+            await _profilesResolver.Received(1).Delete("ValueSet", "123");
         }
     }
 }
